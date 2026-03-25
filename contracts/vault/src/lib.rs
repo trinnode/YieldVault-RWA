@@ -23,6 +23,8 @@ pub enum VaultError {
     AlreadyInitialized = 1,
     InsufficientShares = 2,
     InvalidAmount = 3,
+    ArithmeticError = 4,
+    InsufficientAssets = 5,
 }
 
 #[contract]
@@ -30,6 +32,18 @@ pub struct YieldVault;
 
 #[contractimpl]
 impl YieldVault {
+    fn checked_add(a: i128, b: i128) -> Result<i128, VaultError> {
+        a.checked_add(b).ok_or(VaultError::ArithmeticError)
+    }
+
+    fn checked_sub(a: i128, b: i128) -> Result<i128, VaultError> {
+        a.checked_sub(b).ok_or(VaultError::ArithmeticError)
+    }
+
+    fn checked_mul(a: i128, b: i128) -> Result<i128, VaultError> {
+        a.checked_mul(b).ok_or(VaultError::ArithmeticError)
+    }
+
     /// Initialize the vault with the underlying asset (USDC) and an admin who controls the strategy.
     pub fn initialize(env: Env, admin: Address, token: Address) -> Result<(), VaultError> {
         admin.require_auth();
@@ -65,24 +79,24 @@ impl YieldVault {
     }
 
     /// Calculates the number of shares given an asset amount based on the current exchange rate.
-    pub fn calculate_shares(env: Env, assets: i128) -> i128 {
+    pub fn calculate_shares(env: Env, assets: i128) -> Result<i128, VaultError> {
         let ts = Self::total_shares(env.clone());
         let ta = Self::total_assets(env.clone());
         if ta == 0 || ts == 0 {
-            assets
+            Ok(assets)
         } else {
-            assets * ts / ta
+            Ok(Self::checked_mul(assets, ts)? / ta)
         }
     }
 
     /// Calculates the underlying asset value given an amount of shares.
-    pub fn calculate_assets(env: Env, shares: i128) -> i128 {
+    pub fn calculate_assets(env: Env, shares: i128) -> Result<i128, VaultError> {
         let ts = Self::total_shares(env.clone());
         let ta = Self::total_assets(env.clone());
         if ts == 0 {
-            0
+            Ok(0)
         } else {
-            shares * ta / ts
+            Ok(Self::checked_mul(shares, ta)? / ts)
         }
     }
 
@@ -96,7 +110,7 @@ impl YieldVault {
         let token_addr = Self::token(env.clone());
         let token_client = token::Client::new(&env, &token_addr);
 
-        let shares_to_mint = Self::calculate_shares(env.clone(), amount);
+        let shares_to_mint = Self::calculate_shares(env.clone(), amount)?;
         
         // Transfer assets from user to vault
         token_client.transfer(&user, &env.current_contract_address(), &amount);
@@ -106,13 +120,20 @@ impl YieldVault {
 
         // Update state
         let ta = Self::total_assets(env.clone());
-        env.storage().instance().set(&DataKey::TotalAssets, &(ta + amount));
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalAssets, &Self::checked_add(ta, amount)?);
         
         let ts = Self::total_shares(env.clone());
-        env.storage().instance().set(&DataKey::TotalShares, &(ts + shares_to_mint));
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalShares, &Self::checked_add(ts, shares_to_mint)?);
 
         let user_shares = Self::balance(env.clone(), user.clone());
-        env.storage().instance().set(&DataKey::ShareBalance(user.clone()), &(user_shares + shares_to_mint));
+        env.storage().instance().set(
+            &DataKey::ShareBalance(user.clone()),
+            &Self::checked_add(user_shares, shares_to_mint)?,
+        );
         
         Ok(shares_to_mint)
     }
@@ -129,23 +150,34 @@ impl YieldVault {
             return Err(VaultError::InsufficientShares);
         }
 
-        let assets_to_return = Self::calculate_assets(env.clone(), shares);
+        let assets_to_return = Self::calculate_assets(env.clone(), shares)?;
 
         let token_addr = Self::token(env.clone());
         let token_client = token::Client::new(&env, &token_addr);
+        let vault_address = env.current_contract_address();
+        let vault_token_balance = token_client.balance(&vault_address);
+        if vault_token_balance < assets_to_return {
+            return Err(VaultError::InsufficientAssets);
+        }
 
         // Transfer assets from vault to user
-        token_client.transfer(&env.current_contract_address(), &user, &assets_to_return);
+        token_client.transfer(&vault_address, &user, &assets_to_return);
 
         // Update state
         let ta = Self::total_assets(env.clone());
-        env.storage().instance().set(&DataKey::TotalAssets, &(ta - assets_to_return));
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalAssets, &Self::checked_sub(ta, assets_to_return)?);
         
         let ts = Self::total_shares(env.clone());
-        env.storage().instance().set(&DataKey::TotalShares, &(ts - shares));
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalShares, &Self::checked_sub(ts, shares)?);
 
-        let vault_balance = Self::balance(env.clone(), user.clone());
-        env.storage().instance().set(&DataKey::ShareBalance(user.clone()), &(vault_balance - shares));
+        env.storage().instance().set(
+            &DataKey::ShareBalance(user.clone()),
+            &Self::checked_sub(user_shares, shares)?,
+        );
 
         // Emit Withdraw event
         env.events().publish((symbol_short!("withdraw"), user.clone()), (assets_to_return, shares));
@@ -156,9 +188,12 @@ impl YieldVault {
     /// Admin function to artificially accrue yield, simulating returns from an RWA strategy.
     /// This simply bumps the `total_assets` tracked by the vault, immediately increasing the
     /// exchange rate for all share holders. Real implementation would pull this from an RWA protocol.
-    pub fn accrue_yield(env: Env, amount: i128) {
+    pub fn accrue_yield(env: Env, amount: i128) -> Result<(), VaultError> {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        if amount <= 0 {
+            return Err(VaultError::InvalidAmount);
+        }
 
         let token_addr = Self::token(env.clone());
         let token_client = token::Client::new(&env, &token_addr);
@@ -167,6 +202,10 @@ impl YieldVault {
         token_client.transfer(&admin, &env.current_contract_address(), &amount);
 
         let ta = Self::total_assets(env.clone());
-        env.storage().instance().set(&DataKey::TotalAssets, &(ta + amount));
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalAssets, &Self::checked_add(ta, amount)?);
+
+        Ok(())
     }
 }

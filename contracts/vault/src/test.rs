@@ -1,8 +1,8 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::testutils::{Address as _, Events as _};
-use soroban_sdk::{token, Address, Env, IntoVal, TryFromVal};
+use soroban_sdk::testutils::Address as _;
+use soroban_sdk::{token, Address, Env};
 
 fn create_token_contract<'a>(e: &Env, admin: &Address) -> token::Client<'a> {
     let token_address = e.register_stellar_asset_contract_v2(admin.clone()).address();
@@ -95,4 +95,56 @@ fn test_deposit_invalid_amount() {
     // Try depositing -1 - should fail
     let result = vault.try_deposit(&user, &-1);
     assert!(result.is_err());
+}
+
+#[test]
+fn test_withdraw_invalid_amount_and_insufficient_shares() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let usdc = create_token_contract(&env, &token_admin);
+    let usdc_admin_client = token::StellarAssetClient::new(&env, &usdc.address);
+    usdc_admin_client.mint(&user, &100);
+
+    let vault_id = env.register(YieldVault, ());
+    let vault = YieldVaultClient::new(&env, &vault_id);
+
+    vault.initialize(&admin, &usdc.address);
+    vault.deposit(&user, &100);
+
+    let zero_amount = vault.try_withdraw(&user, &0);
+    assert_eq!(zero_amount, Err(Ok(VaultError::InvalidAmount)));
+
+    let too_many_shares = vault.try_withdraw(&user, &101);
+    assert_eq!(too_many_shares, Err(Ok(VaultError::InsufficientShares)));
+}
+
+#[test]
+fn test_withdraw_fails_when_vault_token_balance_is_short() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let usdc = create_token_contract(&env, &token_admin);
+    let usdc_admin_client = token::StellarAssetClient::new(&env, &usdc.address);
+    usdc_admin_client.mint(&user, &100);
+
+    let vault_id = env.register(YieldVault, ());
+    let vault = YieldVaultClient::new(&env, &vault_id);
+
+    vault.initialize(&admin, &usdc.address);
+    vault.deposit(&user, &100);
+
+    // Simulate tokens leaving the contract without updating tracked assets.
+    usdc.transfer(&vault_id, &admin, &1);
+
+    let result = vault.try_withdraw(&user, &100);
+    assert_eq!(result, Err(Ok(VaultError::InsufficientAssets)));
 }
